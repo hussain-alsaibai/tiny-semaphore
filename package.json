@@ -1,0 +1,16 @@
+{
+  "name": "tiny-semaphore",
+  "version": "0.1.0",
+  "description": "Zero-dependency async-aware concurrency limiter. FIFO fair, timeout support, stats introspection.",
+  "readme": "README.md",
+  "license": "MIT",
+  "keywords": ["semaphore", "concurrency", "rate-limiting", "async", "throttling"],
+  "authors": [{"name": "Hussain Alsaibai", "email": "hussain.alsaibai@gmail.com"}],
+  "repository": {"type": "git", "url": "https://github.com/hussain-alsaibai/tiny-semaphore"},
+  "classifiers": [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3"
+  ],
+  "requiresPython": ">=3.8"
+}

@@ -201,6 +201,7 @@ class AsyncSemaphore:
             except asyncio.CancelledError:
                 await self._cancel_waiter(fut)
                 raise
+            self._claim_slot_after_wake()
         else:
             try:
                 await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
@@ -210,6 +211,18 @@ class AsyncSemaphore:
             except asyncio.CancelledError:
                 await self._cancel_waiter(fut)
                 raise
+            self._claim_slot_after_wake()
+
+    def _claim_slot_after_wake(self) -> None:
+        """Consume the slot that ``release()`` handed to this waiter.
+
+        ``release()`` returns the slot by incrementing ``_value`` and then
+        signals this future. The waiter owns the slot from that point, so it
+        must decrement here — otherwise the permit is counted twice: once as
+        available and once as held.
+        """
+        with self._lock:
+            self._value -= 1
 
     async def _cancel_waiter(self, fut: asyncio.Future[None]) -> None:
         with self._lock:
@@ -227,15 +240,20 @@ class AsyncSemaphore:
                 raise RuntimeError("release() called more times than acquire()")
             self._active -= 1
             self._total_released += 1
-            # Wake the next waiter if any; otherwise return a slot.
+            # Return the slot first, then hand off to the next waiter.
+            #
+            # The woken waiter resumes inside ``_wait_for_slot`` and decrements
+            # ``_value`` itself. Consuming the slot here as well double-counts
+            # the release: ``_value`` drops below zero, and once the waiter's
+            # own ``release()`` runs the semaphore is permanently one slot
+            # short. With ``limit=1`` that means the next ``acquire()`` blocks
+            # forever.
+            self._value += 1
             while self._waiters:
                 nxt = self._waiters.popleft()
                 if not nxt.done():
-                    # Slot is consumed by this waiter.
-                    self._value -= 1
                     loop.call_soon_threadsafe(_set_result, nxt, None)
                     return
-            self._value += 1
 
     # ------------------------------------------------------------------ #
     # Context manager API

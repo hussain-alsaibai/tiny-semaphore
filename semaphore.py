@@ -71,6 +71,12 @@ class Semaphore:
                 await future
             else:
                 await asyncio.wait_for(future, timeout=timeout)
+            # ``release()`` incremented ``_permits`` before waking us, so the
+            # permit is currently counted twice: once as available and once as
+            # ours. Claim it here. Without this a ``max_permits=1`` semaphore
+            # hands out a second permit while the first is still held, and the
+            # concurrency cap silently stops working.
+            self._permits -= 1
             self._acquired_count += 1
             self._peak_acquired = max(self._peak_acquired, self.max_permits - self._permits)
         except asyncio.TimeoutError:

@@ -38,12 +38,22 @@ class Semaphore:
         self.max_permits = max_permits
         self.name = name
         self._permits = max_permits
-        self._waiters: asyncio.Queue[asyncio.Future[bool]] = asyncio.Queue()
-        self._lock = asyncio.Lock()
+        # The wait queue is created lazily, on first use inside the running
+        # loop. Building it here binds it to whatever loop
+        # ``asyncio.get_event_loop()`` returns at construction time -- which
+        # raises ``RuntimeError: There is no current event loop`` on Python 3.8
+        # and 3.9 when the object is created outside a coroutine. 3.10+
+        # tolerates it, which is why this only ever showed up in CI.
+        self._waiters: Optional[asyncio.Queue[asyncio.Future[bool]]] = None
         # Stats
         self._acquired_count = 0
         self._peak_acquired = 0
         self._total_releases = 0
+
+    def _ensure_loop_objects(self) -> None:
+        """Create the wait queue inside the running loop, once."""
+        if self._waiters is None:
+            self._waiters = asyncio.Queue()
 
     # ── Acquire / Release ─────────────────────────────────────────────────────
 
@@ -63,7 +73,8 @@ class Semaphore:
             raise AcquireTimeout(self.name, 0.0)
 
         # Create a future the release() will signal
-        future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+        self._ensure_loop_objects()
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         await self._waiters.put(future)
 
         try:
@@ -82,7 +93,8 @@ class Semaphore:
         except asyncio.TimeoutError:
             # Remove ourselves from the queue
             try:
-                self._waiters.get_nowait()
+                if self._waiters is not None:
+                    self._waiters.get_nowait()
             except asyncio.QueueEmpty:
                 pass
             raise AcquireTimeout(self.name, timeout)
@@ -111,6 +123,8 @@ class Semaphore:
 
     def _wake_one(self) -> None:
         """Wake the oldest waiter if any."""
+        if self._waiters is None:
+            return
         try:
             future: asyncio.Future[bool] = self._waiters.get_nowait()
             if not future.done():
@@ -157,7 +171,7 @@ class Semaphore:
             "max_permits": self.max_permits,
             "available": self._permits,
             "acquired": acquired,
-            "waiters": self._waiters.qsize(),
+            "waiters": self._waiters.qsize() if self._waiters is not None else 0,
             "peak_acquired": self._peak_acquired,
             "total_releases": self._total_releases,
         }
@@ -167,7 +181,7 @@ class Semaphore:
         return self._permits
 
     def __repr__(self) -> str:
-        return f"<Semaphore {self.name} permits={self._permits}/{self.max_permits} waiters={self._waiters.qsize()}>"
+        return f"<Semaphore {self.name} permits={self._permits}/{self.max_permits} waiters={self._waiters.qsize() if self._waiters is not None else 0}>"
 
     def __str__(self) -> str:
         return self.__repr__()

@@ -38,24 +38,32 @@ class Semaphore:
         self.max_permits = max_permits
         self.name = name
         self._permits = max_permits
-        # The wait queue is created lazily, on first use inside the running
-        # loop. Building it here binds it to whatever loop
-        # ``asyncio.get_event_loop()`` returns at construction time -- which
-        # raises ``RuntimeError: There is no current event loop`` on Python 3.8
-        # and 3.9 when the object is created outside a coroutine. 3.10+
-        # tolerates it, which is why this only ever showed up in CI.
-        self._waiters: Optional[asyncio.Queue[asyncio.Future[bool]]] = None
+        # Created lazily: before Python 3.10, asyncio.Queue() and
+        # asyncio.Lock() reach for the current event loop at construction
+        # time. Building them in __init__ makes `Semaphore(...)` raise
+        # RuntimeError("There is no current event loop") on 3.8/3.9 whenever
+        # it is constructed outside a running loop -- for example after any
+        # asyncio.run() has closed the previous loop.
+        self._waiters = None
+        self._lock = None
         # Stats
         self._acquired_count = 0
         self._peak_acquired = 0
         self._total_releases = 0
 
-    def _ensure_loop_objects(self) -> None:
-        """Create the wait queue inside the running loop, once."""
+    # ── Acquire / Release ─────────────────────────────────────────────────────
+
+    def _get_waiters(self) -> "asyncio.Queue[asyncio.Future[bool]]":
+        """The waiter queue, created on first use inside a running loop."""
         if self._waiters is None:
             self._waiters = asyncio.Queue()
+        return self._waiters
 
-    # ── Acquire / Release ─────────────────────────────────────────────────────
+    def _get_lock(self) -> "asyncio.Lock":
+        """The internal lock, created on first use inside a running loop."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def acquire(self, timeout: Optional[float] = None) -> None:
         """
@@ -73,39 +81,45 @@ class Semaphore:
             raise AcquireTimeout(self.name, 0.0)
 
         # Create a future the release() will signal
-        self._ensure_loop_objects()
-        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-        await self._waiters.put(future)
+        future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+        await self._get_waiters().put(future)
 
         try:
             if timeout is None:
                 await future
             else:
                 await asyncio.wait_for(future, timeout=timeout)
-            # ``release()`` incremented ``_permits`` before waking us, so the
-            # permit is currently counted twice: once as available and once as
-            # ours. Claim it here. Without this a ``max_permits=1`` semaphore
-            # hands out a second permit while the first is still held, and the
-            # concurrency cap silently stops working.
-            self._permits -= 1
+            # The permit was transferred by release() -> _wake_one(); it is
+            # already out of the pool, so only the stats change here.
             self._acquired_count += 1
             self._peak_acquired = max(self._peak_acquired, self.max_permits - self._permits)
         except asyncio.TimeoutError:
             # Remove ourselves from the queue
             try:
-                if self._waiters is not None:
-                    self._waiters.get_nowait()
+                self._get_waiters().get_nowait()
             except asyncio.QueueEmpty:
                 pass
             raise AcquireTimeout(self.name, timeout)
 
     def release(self) -> None:
-        """Release one permit. Not async — safe to call from sync code."""
+        """Release one permit. Not async — safe to call from sync code.
+
+        A permit that is handed directly to a waiting acquirer is NOT
+        credited back to the pool: the waiter consumes it on wake. Only an
+        unreferenced permit returns to `_permits`. Crediting the pool and
+        waking a waiter as well would double-count the permit, and because
+        this method refuses to add past `max_permits`, the pool would fill
+        up and stop waking anyone -- starving waiters forever.
+        """
+        self._total_releases += 1
+        # Sync caller: if there are no waiters, or the queue was never
+        # created, there is nothing to wake and no event loop is required.
+        # Building a Queue here would raise on 3.8/3.9 outside a loop.
+        if self._waiters is not None and self._wake_one():
+            return  # the permit passed straight through to the waiter
         if self._permits >= self.max_permits:
             return  # Already at max — shouldn't happen with correct use
         self._permits += 1
-        self._total_releases += 1
-        self._wake_one()
 
     def release_many(self, n: int) -> None:
         """Release n permits at once."""
@@ -121,16 +135,23 @@ class Semaphore:
             return True
         return False
 
-    def _wake_one(self) -> None:
-        """Wake the oldest waiter if any."""
+    def _wake_one(self) -> bool:
+        """Hand a permit to the oldest waiter.
+
+        Returns True when a waiter took the permit (so the caller must not
+        also credit it to the pool), False when nobody was waiting.
+        """
         if self._waiters is None:
-            return
-        try:
-            future: asyncio.Future[bool] = self._waiters.get_nowait()
-            if not future.done():
-                future.set_result(True)
-        except asyncio.QueueEmpty:
-            pass
+            return False
+        while True:
+            try:
+                future: asyncio.Future[bool] = self._waiters.get_nowait()
+            except asyncio.QueueEmpty:
+                return False
+            if future.done():
+                continue  # cancelled/timed-out waiter: drop it, try the next
+            future.set_result(True)
+            return True
 
     # ── Context managers ──────────────────────────────────────────────────────
 

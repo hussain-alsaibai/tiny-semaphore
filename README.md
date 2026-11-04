@@ -24,7 +24,7 @@ Or copy `semaphore.py` into your project. Zero dependencies.
 ## Quick Start
 
 ```python
-from tiny_semaphore import Semaphore
+from semaphore import Semaphore
 
 # Limit to 5 concurrent database writes
 db_sem = Semaphore(max_permits=5, name="db-writes")
@@ -52,7 +52,7 @@ Python's built-in `asyncio.Semaphore` is great — but it's *fairness-blind*. If
 ## API Reference
 
 ```python
-from tiny_semaphore import Semaphore
+from semaphore import Semaphore
 
 sem = Semaphore(
     max_permits=10,    # Maximum concurrent holders
@@ -104,7 +104,7 @@ async with sem.acquire(timeout=5.0):
 ## Real-World: LLM Rate Limiting
 
 ```python
-from tiny_semaphore import Semaphore
+from semaphore import Semaphore
 import anthropic
 
 # Anthropic caps at 10 concurrent requests
@@ -126,7 +126,7 @@ results = await asyncio.gather(*[call_claude(p) for p in prompts])
 ## Real-World: Database Connection Pool
 
 ```python
-from tiny_semaphore import Semaphore
+from semaphore import Semaphore
 
 # Your DB has 20 max connections
 db_sem = Semaphore(max_permits=20, name="pg-pool")

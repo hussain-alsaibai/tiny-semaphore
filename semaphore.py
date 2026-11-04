@@ -71,6 +71,8 @@ class Semaphore:
                 await future
             else:
                 await asyncio.wait_for(future, timeout=timeout)
+            # The permit was transferred by release() -> _wake_one(); it is
+            # already out of the pool, so only the stats change here.
             self._acquired_count += 1
             self._peak_acquired = max(self._peak_acquired, self.max_permits - self._permits)
         except asyncio.TimeoutError:
@@ -82,12 +84,21 @@ class Semaphore:
             raise AcquireTimeout(self.name, timeout)
 
     def release(self) -> None:
-        """Release one permit. Not async — safe to call from sync code."""
+        """Release one permit. Not async — safe to call from sync code.
+
+        A permit that is handed directly to a waiting acquirer is NOT
+        credited back to the pool: the waiter consumes it on wake. Only an
+        unreferenced permit returns to `_permits`. Crediting the pool and
+        waking a waiter as well would double-count the permit, and because
+        this method refuses to add past `max_permits`, the pool would fill
+        up and stop waking anyone -- starving waiters forever.
+        """
+        self._total_releases += 1
+        if self._wake_one():
+            return  # the permit passed straight through to the waiter
         if self._permits >= self.max_permits:
             return  # Already at max — shouldn't happen with correct use
         self._permits += 1
-        self._total_releases += 1
-        self._wake_one()
 
     def release_many(self, n: int) -> None:
         """Release n permits at once."""
@@ -103,14 +114,21 @@ class Semaphore:
             return True
         return False
 
-    def _wake_one(self) -> None:
-        """Wake the oldest waiter if any."""
-        try:
-            future: asyncio.Future[bool] = self._waiters.get_nowait()
-            if not future.done():
-                future.set_result(True)
-        except asyncio.QueueEmpty:
-            pass
+    def _wake_one(self) -> bool:
+        """Hand a permit to the oldest waiter.
+
+        Returns True when a waiter took the permit (so the caller must not
+        also credit it to the pool), False when nobody was waiting.
+        """
+        while True:
+            try:
+                future: asyncio.Future[bool] = self._waiters.get_nowait()
+            except asyncio.QueueEmpty:
+                return False
+            if future.done():
+                continue  # cancelled/timed-out waiter: drop it, try the next
+            future.set_result(True)
+            return True
 
     # ── Context managers ──────────────────────────────────────────────────────
 

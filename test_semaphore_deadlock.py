@@ -98,3 +98,36 @@ def test_release_without_waiters_returns_permit_to_pool():
 
     sem = _run(main())
     assert sem.available == 2, "extra release inflated the pool: %s" % sem.available
+
+
+def test_can_construct_after_asyncio_run_closed_the_loop():
+    """3.8/3.9 only: `Semaphore()` must not require a live event loop.
+
+    `asyncio.Queue()` and `asyncio.Lock()` grab the current event loop at
+    construction time before Python 3.10. Building them in `__init__` made
+    `Semaphore(max_permits=2)` raise
+
+        RuntimeError: There is no current event loop in thread 'MainThread'.
+
+    as soon as any earlier `asyncio.run()` had closed the loop -- which is
+    the normal state of a sync program that has used asyncio once. The
+    queue and lock are now created on first use inside a running loop.
+    """
+    asyncio.run(asyncio.sleep(0))          # closes and unsets the loop
+    sem = Semaphore(max_permits=2)          # must not raise
+    assert sem.available == 2
+
+
+def test_sync_release_works_without_any_event_loop():
+    """`release()` is sync; it must not build asyncio objects.
+
+    It called `_get_waiters()`, which constructs an `asyncio.Queue` -- and
+    that raises on 3.8/3.9 when no loop is running. A sync release with no
+    waiters should just return the permit to the pool.
+    """
+    asyncio.run(asyncio.sleep(0))
+    sem = Semaphore(max_permits=1)
+    assert sem.try_acquire() is True
+    assert sem.try_acquire() is False
+    sem.release()                           # must not raise
+    assert sem.available == 1
